@@ -1,0 +1,33 @@
+name: Daily HSK quiz
+
+on:
+  schedule:
+    - cron: "3 * * * *"    # каждый час в :03 — обработать кнопки и отправить вопросы тем, у кого наступило время
+  workflow_dispatch:         # кнопка «Run workflow» — запустить вручную
+
+permissions:
+  contents: write            # чтобы сохранять state.enc (подписчики, настройки и ответы, зашифровано)
+
+concurrency:
+  group: daily-quiz
+  cancel-in-progress: false
+
+jobs:
+  quiz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Send quiz
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: python3 daily_quiz.py
+
+      - name: Save state
+        run: |
+          git config user.name "hsk-quiz-bot"
+          git config user.email "hsk-quiz-bot@users.noreply.github.com"
+          git add state.enc
+          git commit -m "Обновить состояние викторины" || { echo "Нет изменений"; exit 0; }
+          git pull --rebase -q
+          git push
