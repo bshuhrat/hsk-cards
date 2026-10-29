@@ -199,17 +199,18 @@ async function handleMessage(env, msg) {
         chat_id: cid, reply_markup: replyKeyboard(),
         text: `Привет! 👋 Я буду каждый день присылать ${QUESTIONS_PER_DAY} вопросов по словам HSK 3.0.\n\n` +
           "Слова, в которых ошибётесь, я повторю в следующие дни.\n" +
-          "Уровень и время можно поменять в «⚙️ Настройки». А вот первый урок:",
+          "Уровень и время можно поменять кнопкой «⚙️ Настройки» внизу. А вот первый урок:",
       });
-      await sendSettings(env, cid, sub);
       await sendLesson(env, cid, sub, true);
     } else {
       if (sub.paused) {
         sub.paused = false;
         await putSub(env, cid, sub);
       }
-      await api(env, "sendMessage", { chat_id: cid, text: "Бот включён ✅", reply_markup: replyKeyboard() });
-      await sendSettings(env, cid, sub);
+      await api(env, "sendMessage", {
+        chat_id: cid, reply_markup: replyKeyboard(),
+        text: "Бот включён ✅ Уровень и время — кнопка «⚙️ Настройки» внизу.",
+      });
     }
     return;
   }
