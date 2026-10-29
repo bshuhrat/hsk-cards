@@ -3,7 +3,7 @@
 // * Кнопки работают сразу: Telegram присылает каждое нажатие на адрес воркера (webhook).
 // * Раз в 10 минут воркер проверяет, у кого наступило выбранное время, и отправляет урок.
 // * Данные (настройки, ответы, повторения) хранятся в Workers KV.
-// * Администратор (/admin — первый, кто отправит) получает уведомления о пользователях
+// * Администратор (/admin — первый, кто отправит) получает уведомления о пользователях и отзывы
 //   и кнопку «👥 Пользователи» со списком и статистикой.
 // * Слова берутся из daily_quiz.py при установке (см. .github/workflows/daily-quiz.yaml).
 import WORDS from "./words.json";
@@ -22,6 +22,8 @@ const CARDS_URL = "https://bshuhrat.github.io/hsk-cards/";
 const BTN_LESSON = "▶️ Урок сейчас";
 const BTN_SETTINGS = "⚙️ Настройки";
 const BTN_USERS = "👥 Пользователи";             // только у администратора
+const BTN_FEEDBACK = "💬 Отзыв";
+const FEEDBACK_WAIT = 15 * 60000;                // сколько ждать текст отзыва после нажатия кнопки
 const MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля",
   "августа", "сентября", "октября", "ноября", "декабря"];
 // -------------------------------------------
@@ -256,8 +258,8 @@ async function sendUsers(env, cid) {
 
 // ---------- кнопки ----------
 function replyKeyboard(isAdmin) {
-  const rows = [[{ text: BTN_LESSON }, { text: BTN_SETTINGS }]];
-  if (isAdmin) rows.push([{ text: BTN_USERS }]);
+  const rows = [[{ text: BTN_LESSON }, { text: BTN_SETTINGS }],
+    isAdmin ? [{ text: BTN_FEEDBACK }, { text: BTN_USERS }] : [{ text: BTN_FEEDBACK }]];
   return {
     keyboard: rows, resize_keyboard: true, is_persistent: true,
     input_field_placeholder: "Пользуйтесь кнопками 👇",
@@ -330,6 +332,21 @@ async function handleMessage(env, msg) {
   const del = () => quiet(api(env, "deleteMessage", { chat_id: cid, message_id: msg.message_id }));
   let sub = await getSub(env, cid);
 
+  if (isAdmin && msg.reply_to_message && !cmd) {
+    const target = await env.KV.get("fb:" + msg.reply_to_message.message_id);
+    if (target) {
+      const ok = await quiet(api(env, "sendMessage", {
+        chat_id: target, parse_mode: "HTML", text: "💬 <b>Ответ автора бота:</b>",
+      }));
+      const copied = ok && await quiet(api(env, "copyMessage", { chat_id: target, from_chat_id: cid, message_id: msg.message_id }));
+      await api(env, "sendMessage", {
+        chat_id: cid, reply_to_message_id: msg.message_id,
+        text: copied ? "✅ Ответ отправлен" : "⚠️ Не удалось отправить — возможно, пользователь заблокировал бота",
+      });
+      return;
+    }
+  }
+
   if (cmd === "/admin" && (!admin || isAdmin)) {
     if (!admin) await env.KV.put("admin", cid);
     await api(env, "sendMessage", {
@@ -370,11 +387,23 @@ async function handleMessage(env, msg) {
     return;
   }
   if (!sub) {
+    if (isAdmin) return; // администратору писать можно
     await del();
-    await hint(env, cid, "Чтобы начать, нажмите /start", isAdmin);
+    await hint(env, cid, "Чтобы начать, нажмите /start", false);
     return;
   }
   if (refreshProfile(sub, msg.from)) await putSub(env, cid, sub);
+
+  const isButton = [BTN_LESSON, BTN_SETTINGS, BTN_FEEDBACK, BTN_USERS].includes(text) || !!cmd;
+  if (sub.fb_wait) {
+    const waiting = Date.now() - sub.fb_wait < FEEDBACK_WAIT;
+    delete sub.fb_wait;
+    await putSub(env, cid, sub);
+    if (waiting && !isButton) {
+      await receiveFeedback(env, cid, sub, msg);
+      return;
+    }
+  }
 
   if (cmd === "/stop") {
     sub.paused = true;
@@ -390,13 +419,49 @@ async function handleMessage(env, msg) {
   } else if (text === BTN_LESSON || cmd === "/lesson") {
     await del();
     await sendLesson(env, cid, sub, false);
+  } else if (text === BTN_FEEDBACK || cmd === "/feedback") {
+    await del();
+    sub.fb_wait = Date.now();
+    await putSub(env, cid, sub);
+    await api(env, "sendMessage", {
+      chat_id: cid, parse_mode: "HTML",
+      text: "💬 <b>Отзыв о боте</b>\n\nЧто понравилось, что неудобно, чего не хватает? " +
+        "Напишите одним сообщением — можно текстом, фото или голосовым. Я передам автору бота.",
+      reply_markup: { inline_keyboard: [[{ text: "✖️ Отмена", callback_data: "fb_cancel" }]] },
+    });
   } else if (isAdmin && (text === BTN_USERS || cmd === "/users")) {
     await del();
     await sendUsers(env, cid);
-  } else { // текст, файлы, фото, стикеры — не нужны
+  } else if (isAdmin) {
+    // администратору писать можно — его сообщения не трогаем
+  } else { // у остальных текст, файлы, фото, стикеры удаляются
     await del();
-    await hint(env, cid, "Я понимаю только кнопки 👇", isAdmin);
+    await hint(env, cid, "Я понимаю только кнопки 👇", false);
   }
+}
+
+async function receiveFeedback(env, cid, sub, msg) {
+  await env.KV.put(`f:${new Date().toISOString()}:${cid}`, JSON.stringify({
+    chat: cid, name: sub.name, username: sub.username, text: msg.text || msg.caption || "",
+  }), { expirationTtl: 365 * 86400 });
+  const admin = await adminId(env);
+  let delivered = false;
+  if (admin && admin !== cid) {
+    const head = await quiet(api(env, "sendMessage", {
+      chat_id: admin, parse_mode: "HTML", link_preview_options: { is_disabled: true },
+      text: `💬 <b>Новый отзыв</b>\n\n${await userCard(env, cid, sub, null)}\n\n<i>Ответьте на сообщение с отзывом (свайп → Ответить), и я перешлю ответ пользователю.</i>`,
+    }));
+    const copy = await quiet(api(env, "copyMessage", { chat_id: admin, from_chat_id: cid, message_id: msg.message_id }));
+    for (const m of [head, copy]) {
+      if (m && m.message_id) await env.KV.put("fb:" + m.message_id, cid, { expirationTtl: 90 * 86400 });
+    }
+    delivered = !!copy;
+  }
+  await api(env, "sendMessage", {
+    chat_id: cid, parse_mode: "HTML", reply_markup: replyKeyboard(admin === cid),
+    text: delivered || admin === cid ? "🙏 <b>Спасибо за отзыв!</b>\nЯ передал его автору бота." :
+      "🙏 <b>Спасибо за отзыв!</b>\nЯ его сохранил.",
+  });
 }
 
 async function handleCallback(env, cq) {
@@ -421,6 +486,14 @@ async function handleCallback(env, cq) {
     sub.paused = !sub.paused;
     changed = true;
     note = sub.paused ? "⏸ Пауза" : "▶️ Вопросы включены";
+  } else if (data === "fb_cancel") {
+    if (sub && sub.fb_wait) {
+      delete sub.fb_wait;
+      await putSub(env, cid, sub);
+    }
+    await quiet(api(env, "answerCallbackQuery", { callback_query_id: cq.id, text: "Отменено" }));
+    if (mid) await quiet(api(env, "deleteMessage", { chat_id: cid, message_id: mid }));
+    return;
   } else if (data === "close") {
     await quiet(api(env, "answerCallbackQuery", { callback_query_id: cq.id }));
     if (mid) await quiet(api(env, "deleteMessage", { chat_id: cid, message_id: mid }));
