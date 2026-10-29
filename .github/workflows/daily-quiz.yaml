@@ -1,33 +1,90 @@
-name: Daily HSK quiz
+name: Deploy HSK bot to Cloudflare
 
+# Устанавливает бота на Cloudflare Workers и подключает его к Telegram.
+# Запускается сам, когда меняются worker.js / daily_quiz.py / этот файл, или вручную кнопкой «Run workflow».
+# Нужны секреты репозитория: TELEGRAM_BOT_TOKEN, CLOUDFLARE_API_TOKEN и CLOUDFLARE_ACCOUNT_ID.
 on:
-  schedule:
-    - cron: "3 * * * *"    # каждый час в :03 — обработать кнопки и отправить вопросы тем, у кого наступило время
-  workflow_dispatch:         # кнопка «Run workflow» — запустить вручную
-
-permissions:
-  contents: write            # чтобы сохранять state.enc (подписчики, настройки и ответы, зашифровано)
+  push:
+    branches: [main]
+    paths: ["worker.js", "daily_quiz.py", ".github/workflows/daily-quiz.yaml"]
+  workflow_dispatch:
 
 concurrency:
-  group: daily-quiz
+  group: deploy-bot
   cancel-in-progress: false
 
 jobs:
-  quiz:
+  deploy:
     runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      WRANGLER: npx --yes wrangler@4
     steps:
       - uses: actions/checkout@v5
 
-      - name: Send quiz
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        run: python3 daily_quiz.py
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
 
-      - name: Save state
+      - name: Check secrets
         run: |
-          git config user.name "hsk-quiz-bot"
-          git config user.email "hsk-quiz-bot@users.noreply.github.com"
-          git add state.enc
-          git commit -m "Обновить состояние викторины" || { echo "Нет изменений"; exit 0; }
-          git pull --rebase -q
-          git push
+          [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo "::error::Нет секрета CLOUDFLARE_API_TOKEN"; exit 1; }
+          [ -n "$TELEGRAM_BOT_TOKEN" ] || { echo "::error::Нет секрета TELEGRAM_BOT_TOKEN"; exit 1; }
+          [ -n "$CLOUDFLARE_ACCOUNT_ID" ] || { echo "::error::Нет секрета CLOUDFLARE_ACCOUNT_ID"; exit 1; }
+
+      - name: Build (слова берутся из daily_quiz.py)
+        run: |
+          mkdir -p build
+          cp worker.js build/
+          python3 - <<'EOF'
+          import ast, json
+          line = next(l for l in open("daily_quiz.py", encoding="utf-8") if l.startswith("WORDS = json.loads("))
+          words = json.loads(ast.literal_eval(line.strip()[len("WORDS = json.loads("):-1]))
+          json.dump(words, open("build/words.json", "w", encoding="utf-8"), ensure_ascii=False)
+          print("Слов:", len(words))
+          EOF
+
+      - name: Storage (Workers KV)
+        working-directory: build
+        run: |
+          find_id() { $WRANGLER kv namespace list 2>/dev/null | jq -r '.[] | select(.title | endswith("hsk-quiz-state")) | .id' | head -1; }
+          ID=$(find_id)
+          if [ -z "$ID" ]; then
+            $WRANGLER kv namespace create hsk-quiz-state
+            ID=$(find_id)
+          fi
+          [ -n "$ID" ] || { echo "::error::Не удалось создать хранилище KV — проверьте права токена"; exit 1; }
+          cat > wrangler.toml <<EOF
+          name = "hsk-quiz-bot"
+          main = "worker.js"
+          compatibility_date = "2025-09-01"
+          workers_dev = true
+
+          [triggers]
+          crons = ["*/10 * * * *"]
+
+          [[kv_namespaces]]
+          binding = "KV"
+          id = "$ID"
+          EOF
+
+      - name: Deploy
+        working-directory: build
+        run: |
+          $WRANGLER deploy 2>&1 | tee deploy.log
+          printf '%s' "$TELEGRAM_BOT_TOKEN" | $WRANGLER secret put TELEGRAM_BOT_TOKEN
+          URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.workers\.dev' deploy.log | head -1)
+          [ -n "$URL" ] || { echo "::error::Не нашёл адрес воркера. Откройте в Cloudflare раздел Workers & Pages и выберите поддомен workers.dev"; exit 1; }
+          echo "WORKER_URL=$URL" >> "$GITHUB_ENV"
+
+      - name: Connect Telegram
+        run: |
+          SECRET=$(printf '%s' "hsk-webhook:$TELEGRAM_BOT_TOKEN" | sha256sum | cut -c1-48)
+          tg() { curl -sS "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/$1" -H 'Content-Type: application/json' -d "$2"; }
+          tg setWebhook "{\"url\":\"$WORKER_URL/telegram\",\"secret_token\":\"$SECRET\",\"allowed_updates\":[\"message\",\"callback_query\",\"poll_answer\"]}" | tee hook.json
+          jq -e .ok hook.json > /dev/null
+          tg setMyCommands '{"commands":[{"command":"start","description":"Запустить бота"},{"command":"settings","description":"Уровень и время"},{"command":"lesson","description":"Урок сейчас"},{"command":"stop","description":"Пауза"}]}'
+          echo
+          echo "Бот работает: $WORKER_URL"
