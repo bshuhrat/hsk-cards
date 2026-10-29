@@ -83,8 +83,8 @@ jobs:
         run: |
           SECRET=$(printf '%s' "hsk-webhook:$TELEGRAM_BOT_TOKEN" | sha256sum | cut -c1-48)
           tg() { curl -sS "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/$1" -H 'Content-Type: application/json' -d "$2"; }
-          tg setWebhook "{\"url\":\"$WORKER_URL/telegram\",\"secret_token\":\"$SECRET\",\"allowed_updates\":[\"message\",\"callback_query\",\"poll_answer\",\"my_chat_member\"]}" | tee hook.json
+          tg setWebhook "{\"url\":\"$WORKER_URL/telegram\",\"secret_token\":\"$SECRET\",\"allowed_updates\":[\"message\",\"callback_query\",\"poll_answer\",\"my_chat_member\",\"pre_checkout_query\"]}" | tee hook.json
           jq -e .ok hook.json > /dev/null
-          tg setMyCommands '{"commands":[{"command":"start","description":"Запустить бота"},{"command":"settings","description":"Уровень и время"},{"command":"lesson","description":"Урок сейчас"},{"command":"stop","description":"Пауза"}]}'
+          tg setMyCommands '{"commands":[{"command":"start","description":"Запустить бота"},{"command":"settings","description":"Уровень и время"},{"command":"lesson","description":"Урок сейчас"},{"command":"stop","description":"Пауза"},{"command":"donate","description":"Поддержать звёздами"},{"command":"paysupport","description":"Помощь с оплатой"}]}'
           echo
           echo "Бот работает: $WORKER_URL"
