@@ -23,6 +23,8 @@ const BTN_LESSON = "▶️ Урок сейчас";
 const BTN_SETTINGS = "⚙️ Настройки";
 const BTN_USERS = "👥 Пользователи";             // только у администратора
 const BTN_FEEDBACK = "💬 Отзыв";
+const BTN_DONATE = "⭐ Поддержать";
+const STAR_AMOUNTS = [10, 50, 100, 500];         // варианты поддержки в Telegram Stars
 const FEEDBACK_WAIT = 15 * 60000;                // сколько ждать текст отзыва после нажатия кнопки
 const MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля",
   "августа", "сентября", "октября", "ноября", "декабря"];
@@ -192,7 +194,7 @@ async function userCard(env, cid, sub, us) {
   }
   if (extra.length) lines.push(extra.join(" · "));
   if (chat.bio) lines.push(`📝 ${esc(chat.bio)}`);
-  lines.push(`📅 с ${fmtDate(sub.since)}`);
+  lines.push(`📅 с ${fmtDate(sub.since)}` + (sub.stars ? ` · ⭐ поддержал на ${sub.stars}` : ""));
   const status = sub.blocked ? "🚫 заблокировал бота" : sub.paused ? "⏸ на паузе" : `⏰ ${String(sub.hour).padStart(2, "0")}:00`;
   lines.push(`📚 HSK ${sub.level} · ${status}`);
   if (us) {
@@ -258,8 +260,8 @@ async function sendUsers(env, cid) {
 
 // ---------- кнопки ----------
 function replyKeyboard(isAdmin) {
-  const rows = [[{ text: BTN_LESSON }, { text: BTN_SETTINGS }],
-    isAdmin ? [{ text: BTN_FEEDBACK }, { text: BTN_USERS }] : [{ text: BTN_FEEDBACK }]];
+  const rows = [[{ text: BTN_LESSON }, { text: BTN_SETTINGS }], [{ text: BTN_FEEDBACK }, { text: BTN_DONATE }]];
+  if (isAdmin) rows.push([{ text: BTN_USERS }]);
   return {
     keyboard: rows, resize_keyboard: true, is_persistent: true,
     input_field_placeholder: "Пользуйтесь кнопками 👇",
@@ -320,6 +322,9 @@ async function handleUpdate(env, u) {
   if (u.callback_query) return handleCallback(env, u.callback_query);
   if (u.poll_answer) return handlePollAnswer(env, u.poll_answer);
   if (u.my_chat_member) return handleMemberChange(env, u.my_chat_member);
+  if (u.pre_checkout_query) { // Telegram спрашивает, можно ли принять оплату — да
+    return api(env, "answerPreCheckoutQuery", { pre_checkout_query_id: u.pre_checkout_query.id, ok: true });
+  }
 }
 
 async function handleMessage(env, msg) {
@@ -331,6 +336,19 @@ async function handleMessage(env, msg) {
   const isAdmin = admin === cid;
   const del = () => quiet(api(env, "deleteMessage", { chat_id: cid, message_id: msg.message_id }));
   let sub = await getSub(env, cid);
+
+  if (msg.successful_payment) {
+    await receivePayment(env, cid, sub, msg);
+    return;
+  }
+  if (cmd === "/paysupport") {
+    await api(env, "sendMessage", {
+      chat_id: cid, parse_mode: "HTML",
+      text: "⭐ <b>Помощь с оплатой</b>\n\nПоддержка звёздами — добровольный подарок автору, взамен ничего не продаётся. " +
+        "Если звёзды ушли по ошибке, напишите через «💬 Отзыв» — разберёмся и вернём.",
+    });
+    return;
+  }
 
   if (isAdmin && msg.reply_to_message && !cmd) {
     const target = await env.KV.get("fb:" + msg.reply_to_message.message_id);
@@ -394,7 +412,7 @@ async function handleMessage(env, msg) {
   }
   if (refreshProfile(sub, msg.from)) await putSub(env, cid, sub);
 
-  const isButton = [BTN_LESSON, BTN_SETTINGS, BTN_FEEDBACK, BTN_USERS].includes(text) || !!cmd;
+  const isButton = [BTN_LESSON, BTN_SETTINGS, BTN_FEEDBACK, BTN_DONATE, BTN_USERS].includes(text) || !!cmd;
   if (sub.fb_wait) {
     const waiting = Date.now() - sub.fb_wait < FEEDBACK_WAIT;
     delete sub.fb_wait;
@@ -429,6 +447,9 @@ async function handleMessage(env, msg) {
         "Напишите одним сообщением — можно текстом, фото или голосовым. Я передам автору бота.",
       reply_markup: { inline_keyboard: [[{ text: "✖️ Отмена", callback_data: "fb_cancel" }]] },
     });
+  } else if (text === BTN_DONATE || cmd === "/donate") {
+    await del();
+    await sendDonateMenu(env, cid);
   } else if (isAdmin && (text === BTN_USERS || cmd === "/users")) {
     await del();
     await sendUsers(env, cid);
@@ -464,6 +485,48 @@ async function receiveFeedback(env, cid, sub, msg) {
   });
 }
 
+async function sendDonateMenu(env, cid) {
+  const admin = await adminId(env);
+  const adminSub = admin ? await getSub(env, admin) : null;
+  const stars = STAR_AMOUNTS.map((n) => ({ text: `⭐ ${n}`, callback_data: `star:${n}` }));
+  const rows = [stars.slice(0, 2), stars.slice(2)];
+  if (adminSub && adminSub.username) {
+    rows.push([{ text: "🎁 Отправить подарок автору", url: `https://t.me/${adminSub.username}` }]);
+  }
+  await api(env, "sendMessage", {
+    chat_id: cid, parse_mode: "HTML",
+    text: "⭐ <b>Поддержать бота</b>\n\nБот бесплатный и делается в свободное время. " +
+      "Если он помогает вам учить китайский — можно отправить автору звёзды Telegram.\n\n" +
+      "Выберите сумму 👇" +
+      (adminSub && adminSub.username ? "\n\n🎁 А подарок Telegram можно отправить через профиль автора: откройте его и нажмите «Подарок»." : ""),
+    reply_markup: { inline_keyboard: rows },
+  });
+}
+
+async function receivePayment(env, cid, sub, msg) {
+  const pay = msg.successful_payment;
+  const n = pay.total_amount;
+  await env.KV.put(`d:${new Date().toISOString()}:${cid}`, JSON.stringify({
+    chat: cid, stars: n, charge: pay.telegram_payment_charge_id, payload: pay.invoice_payload,
+  }));
+  if (sub) {
+    sub.stars = (sub.stars || 0) + n;
+    await putSub(env, cid, sub);
+  }
+  await api(env, "sendMessage", {
+    chat_id: cid, parse_mode: "HTML",
+    text: `💛 <b>Спасибо за ${n} ⭐!</b>\nВаша поддержка очень помогает развивать бота.`,
+  });
+  const admin = await adminId(env);
+  if (admin && admin !== cid) {
+    await quiet(api(env, "sendMessage", {
+      chat_id: admin, parse_mode: "HTML", link_preview_options: { is_disabled: true },
+      text: `⭐ <b>Поддержка: ${n} звёзд</b>\n\n${await userCard(env, cid, sub || { since: today(), level: "—", hour: 0, ...profile(msg.from) }, null)}\n\n` +
+        `<i>ID платежа (для возврата): <code>${esc(pay.telegram_payment_charge_id)}</code></i>`,
+    }));
+  }
+}
+
 async function handleCallback(env, cq) {
   const cid = String(cq.from.id);
   const data = cq.data || "";
@@ -486,6 +549,15 @@ async function handleCallback(env, cq) {
     sub.paused = !sub.paused;
     changed = true;
     note = sub.paused ? "⏸ Пауза" : "▶️ Вопросы включены";
+  } else if (/^star:\d+$/.test(data) && STAR_AMOUNTS.includes(+data.slice(5))) {
+    const n = +data.slice(5);
+    await quiet(api(env, "answerCallbackQuery", { callback_query_id: cq.id }));
+    await api(env, "sendInvoice", {
+      chat_id: cid, title: `Поддержка бота · ${n} ⭐`,
+      description: "Добровольная поддержка автора бота «Китайский каждый день». Спасибо, что помогаете ему развиваться!",
+      payload: `donate:${cid}:${n}`, currency: "XTR", prices: [{ label: "Поддержка", amount: n }],
+    });
+    return;
   } else if (data === "fb_cancel") {
     if (sub && sub.fb_wait) {
       delete sub.fb_wait;
