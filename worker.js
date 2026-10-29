@@ -3,6 +3,8 @@
 // * Кнопки работают сразу: Telegram присылает каждое нажатие на адрес воркера (webhook).
 // * Раз в 10 минут воркер проверяет, у кого наступило выбранное время, и отправляет урок.
 // * Данные (настройки, ответы, повторения) хранятся в Workers KV.
+// * Администратор (/admin — первый, кто отправит) получает уведомления о пользователях
+//   и кнопку «👥 Пользователи» со списком и статистикой.
 // * Слова берутся из daily_quiz.py при установке (см. .github/workflows/daily-quiz.yaml).
 import WORDS from "./words.json";
 
@@ -19,6 +21,7 @@ const MAX_LESSONS_PER_RUN = 7;             // лимит бесплатного 
 const CARDS_URL = "https://bshuhrat.github.io/hsk-cards/";
 const BTN_LESSON = "▶️ Урок сейчас";
 const BTN_SETTINGS = "⚙️ Настройки";
+const BTN_USERS = "👥 Пользователи";             // только у администратора
 const MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля",
   "августа", "сентября", "октября", "ноября", "декабря"];
 // -------------------------------------------
@@ -107,7 +110,8 @@ function shuffle(arr) {
 }
 
 // ---------- хранилище ----------
-// s:<чат>        — настройки подписчика (меняются только кнопками)
+// admin          — чат администратора (тот, кто первым отправил /admin)
+// s:<чат>        — настройки и профиль подписчика
 // u:<чат>        — прогресс: повторения, показанные слова, итоги по дням, дата последнего урока
 // p:<опрос>      — к какому слову относится викторина (живёт 3 дня)
 // a:<чат>:<опрос> — ответ на викторину (учитывается в прогрессе перед следующим уроком)
@@ -123,8 +127,8 @@ async function putSub(env, cid, sub) {
   await env.KV.put("s:" + cid, JSON.stringify(sub));
 }
 
-function newSub() {
-  return { since: today(), level: DEFAULT_LEVEL, hour: DEFAULT_HOUR, paused: false };
+function newSub(from) {
+  return { since: today(), level: DEFAULT_LEVEL, hour: DEFAULT_HOUR, paused: false, ...profile(from) };
 }
 
 async function getProgress(env, cid) {
@@ -132,56 +136,188 @@ async function getProgress(env, cid) {
     { review: [], seen: {}, right: 0, wrong: 0, days: {}, last_sent: null };
 }
 
-// ---------- кнопки ----------
-function replyKeyboard() {
+// ---------- профиль и администратор ----------
+function esc(s) {
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function profile(from) {
+  from = from || {};
   return {
-    keyboard: [[{ text: BTN_LESSON }, { text: BTN_SETTINGS }]],
-    resize_keyboard: true, is_persistent: true,
+    name: [from.first_name, from.last_name].filter(Boolean).join(" "),
+    username: from.username || "",
+    lang: from.language_code || "",
+    premium: !!from.is_premium,
+  };
+}
+
+// обновляет имя/username, если человек их поменял; true — если что-то изменилось
+function refreshProfile(sub, from) {
+  const p = profile(from);
+  let changed = false;
+  for (const k of Object.keys(p)) {
+    if (sub[k] !== p[k]) {
+      sub[k] = p[k];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function fmtDate(iso) {
+  return iso ? iso.split("-").reverse().join(".") : "—";
+}
+
+async function adminId(env) {
+  return await env.KV.get("admin");
+}
+
+async function userCard(env, cid, sub, us) {
+  const chat = (await quiet(api(env, "getChat", { chat_id: cid }))) || {};
+  const name = [chat.first_name, chat.last_name].filter(Boolean).join(" ") || sub.name || "без имени";
+  const username = chat.username || sub.username;
+  const lines = [
+    `👤 <b>${esc(name)}</b>`,
+    username ? `🔗 @${esc(username)}` : "🔗 без username",
+    `🆔 <code>${esc(cid)}</code> · <a href="tg://user?id=${esc(cid)}">открыть профиль</a>`,
+  ];
+  const extra = [];
+  if (sub.lang) extra.push(`🌐 ${esc(sub.lang)}`);
+  if (sub.premium) extra.push("⭐ Premium");
+  if (chat.birthdate) {
+    const b = chat.birthdate;
+    extra.push(`🎂 ${String(b.day).padStart(2, "0")}.${String(b.month).padStart(2, "0")}${b.year ? "." + b.year : ""}`);
+  }
+  if (extra.length) lines.push(extra.join(" · "));
+  if (chat.bio) lines.push(`📝 ${esc(chat.bio)}`);
+  lines.push(`📅 с ${fmtDate(sub.since)}`);
+  const status = sub.blocked ? "🚫 заблокировал бота" : sub.paused ? "⏸ на паузе" : `⏰ ${String(sub.hour).padStart(2, "0")}:00`;
+  lines.push(`📚 HSK ${sub.level} · ${status}`);
+  if (us) {
+    const total = us.right + us.wrong;
+    const pct = total ? Math.round((us.right * 100) / total) : 0;
+    lines.push(`✅ ${us.right} · ❌ ${us.wrong}` + (total ? ` (${pct}%)` : "") +
+      ` · 🔁 ${us.review.length} · последний урок ${fmtDate(us.last_sent)}`);
+  }
+  return lines.join("\n");
+}
+
+async function notifyAdmin(env, cid, title, sub, withPhoto = false) {
+  const admin = await adminId(env);
+  if (!admin || admin === cid) return;
+  const text = `${title}\n\n${await userCard(env, cid, sub, null)}`;
+  if (withPhoto) {
+    const photos = await quiet(api(env, "getUserProfilePhotos", { user_id: +cid, limit: 1 }));
+    const sizes = photos && photos.photos && photos.photos[0];
+    if (sizes && sizes.length && text.length <= 1024) {
+      const ok = await quiet(api(env, "sendPhoto", {
+        chat_id: admin, photo: sizes[sizes.length - 1].file_id, caption: text, parse_mode: "HTML",
+      }));
+      if (ok) return;
+    }
+  }
+  await quiet(api(env, "sendMessage", { chat_id: admin, text, parse_mode: "HTML", link_preview_options: { is_disabled: true } }));
+}
+
+async function sendUsers(env, cid) {
+  const cards = [];
+  let active = 0;
+  let cursor;
+  do {
+    const r = await env.KV.list({ prefix: "s:", cursor });
+    for (const k of r.keys) {
+      const ucid = k.name.slice(2);
+      const sub = await getSub(env, ucid);
+      if (!sub) continue;
+      const us = await getProgress(env, ucid);
+      await foldAnswers(env, ucid, us, true); // учесть ответы, которые ещё не попали в прогресс
+      if (!sub.paused && !sub.blocked) active += 1;
+      cards.push({ since: sub.since, text: await userCard(env, ucid, sub, us) });
+    }
+    cursor = r.list_complete ? null : r.cursor;
+  } while (cursor);
+  cards.sort((a, b) => (a.since < b.since ? -1 : 1));
+  let msg = `👥 <b>Пользователи: ${cards.length}</b> (активных ${active})`;
+  const chunks = [];
+  cards.forEach((c, i) => {
+    const part = `\n\n<b>${i + 1}.</b> ${c.text}`;
+    if ((msg + part).length > 3800) {
+      chunks.push(msg);
+      msg = part.trim();
+    } else {
+      msg += part;
+    }
+  });
+  chunks.push(msg);
+  for (const m of chunks) {
+    await api(env, "sendMessage", { chat_id: cid, text: m, parse_mode: "HTML", link_preview_options: { is_disabled: true } });
+  }
+}
+
+// ---------- кнопки ----------
+function replyKeyboard(isAdmin) {
+  const rows = [[{ text: BTN_LESSON }, { text: BTN_SETTINGS }]];
+  if (isAdmin) rows.push([{ text: BTN_USERS }]);
+  return {
+    keyboard: rows, resize_keyboard: true, is_persistent: true,
     input_field_placeholder: "Пользуйтесь кнопками 👇",
   };
 }
 
+function hh(h) {
+  return String(h).padStart(2, "0") + ":00";
+}
+
 function settingsText(sub) {
   const lv = sub.level;
-  const scope = lv === 1 ? "только HSK 1" : `HSK ${lv}, часть — из HSK 1–${lv - 1}`;
-  const when = sub.paused ? "⏸ на паузе" : `каждый день в ${String(sub.hour).padStart(2, "0")}:00 по Москве`;
-  return "⚙️ Настройки\n\n" +
-    `📚 Уровень: HSK ${lv} (${scope})\n` +
-    `⏰ Вопросы: ${when}\n\n` +
-    "Выберите уровень и время кнопками ниже.";
+  const scope = lv === 1 ? "вопросы только из HSK 1" : `в основном HSK ${lv}, часть — из HSK 1–${lv - 1}`;
+  const when = sub.paused ? "⏸ <b>на паузе</b>" : `⏰ Время: <b>${hh(sub.hour)}</b> по Москве`;
+  return "⚙️ <b>Настройки</b>\n\n" +
+    `📚 Уровень: <b>HSK ${lv}</b>\n<i>${scope}</i>\n\n` +
+    `${when}\n\n` +
+    "Выберите уровень и время 👇";
 }
 
 function settingsKeyboard(sub) {
-  const btn = (text, data, on) => ({ text: (on ? "✅ " : "") + text, callback_data: data });
+  const btn = (text, data, on) => ({ text: on ? `• ${text} •` : text, callback_data: data });
   const lv = LEVELS.map((x) => btn(`HSK ${x}`, `lv:${x}`, sub.level === x));
-  const hr = SEND_HOURS.map((h) => btn(`${String(h).padStart(2, "0")}:00`, `h:${h}`, sub.hour === h && !sub.paused));
+  const hr = SEND_HOURS.map((h) => btn(hh(h), `h:${h}`, sub.hour === h && !sub.paused));
   return {
     inline_keyboard: [
-      lv.slice(0, 3), lv.slice(3), hr.slice(0, 3), hr.slice(3),
+      [{ text: "📚 Уровень", callback_data: "noop" }],
+      lv.slice(0, 3), lv.slice(3),
+      [{ text: "⏰ Время отправки", callback_data: "noop" }],
+      hr.slice(0, 3), hr.slice(3),
       [{ text: sub.paused ? "▶️ Возобновить" : "⏸ Пауза", callback_data: "pause" },
-        { text: "▶️ Урок сейчас", callback_data: "now" }],
+        { text: "✖️ Закрыть", callback_data: "close" }],
     ],
   };
 }
 
 async function sendSettings(env, cid, sub) {
-  await api(env, "sendMessage", { chat_id: cid, text: settingsText(sub), reply_markup: settingsKeyboard(sub) });
+  if (sub.smid) await quiet(api(env, "deleteMessage", { chat_id: cid, message_id: sub.smid })); // старое меню убираем
+  const m = await api(env, "sendMessage", {
+    chat_id: cid, text: settingsText(sub), parse_mode: "HTML", reply_markup: settingsKeyboard(sub),
+  });
+  sub.smid = m.message_id;
+  await putSub(env, cid, sub);
 }
 
 // ---------- входящие ----------
 const lastHint = new Map(); // чтобы не отвечать на каждое лишнее сообщение
 
-async function hint(env, cid, text, keyboard) {
+async function hint(env, cid, text, isAdmin) {
   const now = Date.now();
   if (now - (lastHint.get(cid) || 0) < 30000) return;
   lastHint.set(cid, now);
-  await api(env, "sendMessage", { chat_id: cid, text, ...(keyboard ? { reply_markup: replyKeyboard() } : {}) });
+  await api(env, "sendMessage", { chat_id: cid, text, reply_markup: replyKeyboard(isAdmin) });
 }
 
 async function handleUpdate(env, u) {
   if (u.message) return handleMessage(env, u.message);
   if (u.callback_query) return handleCallback(env, u.callback_query);
   if (u.poll_answer) return handlePollAnswer(env, u.poll_answer);
+  if (u.my_chat_member) return handleMemberChange(env, u.my_chat_member);
 }
 
 async function handleMessage(env, msg) {
@@ -189,50 +325,77 @@ async function handleMessage(env, msg) {
   const cid = String(msg.chat.id);
   const text = (msg.text || "").trim();
   const cmd = text.startsWith("/") ? text.split(/\s+/)[0].split("@")[0].toLowerCase() : "";
+  const admin = await adminId(env);
+  const isAdmin = admin === cid;
+  const del = () => quiet(api(env, "deleteMessage", { chat_id: cid, message_id: msg.message_id }));
   let sub = await getSub(env, cid);
+
+  if (cmd === "/admin" && (!admin || isAdmin)) {
+    if (!admin) await env.KV.put("admin", cid);
+    await api(env, "sendMessage", {
+      chat_id: cid, parse_mode: "HTML", reply_markup: replyKeyboard(true),
+      text: "👑 <b>Вы администратор бота</b>\n\nЯ буду писать вам о новых пользователях, паузах и блокировках. " +
+        "Список всех пользователей — кнопка «👥 Пользователи».",
+    });
+    return;
+  }
 
   if (cmd === "/start") {
     if (!sub) {
-      sub = newSub();
+      sub = newSub(msg.from);
       await putSub(env, cid, sub);
+      const first = (msg.from && msg.from.first_name) || "";
       await api(env, "sendMessage", {
-        chat_id: cid, reply_markup: replyKeyboard(),
-        text: `Привет! 👋 Я буду каждый день присылать ${QUESTIONS_PER_DAY} вопросов по словам HSK 3.0.\n\n` +
-          "Слова, в которых ошибётесь, я повторю в следующие дни.\n" +
-          "Уровень и время можно поменять кнопкой «⚙️ Настройки» внизу. А вот первый урок:",
+        chat_id: cid, parse_mode: "HTML", reply_markup: replyKeyboard(isAdmin),
+        text: `🀄 <b>Добро пожаловать${first ? ", " + esc(first) : ""}!</b>\n\n` +
+          `Каждый день я буду присылать <b>${QUESTIONS_PER_DAY} вопросов</b> по словам HSK 3.0.\n\n` +
+          "🔁 Слова с ошибками повторю в следующие дни\n" +
+          "⚙️ Уровень и время — кнопка «Настройки» внизу\n\n" +
+          "А вот первый урок 👇",
       });
+      await notifyAdmin(env, cid, "🆕 <b>Новый пользователь</b>", sub, true);
       await sendLesson(env, cid, sub, true);
     } else {
-      if (sub.paused) {
-        sub.paused = false;
-        await putSub(env, cid, sub);
-      }
+      const wasOff = sub.paused || sub.blocked;
+      sub.paused = false;
+      sub.blocked = false;
+      refreshProfile(sub, msg.from);
+      await putSub(env, cid, sub);
       await api(env, "sendMessage", {
-        chat_id: cid, reply_markup: replyKeyboard(),
-        text: "Бот включён ✅ Уровень и время — кнопка «⚙️ Настройки» внизу.",
+        chat_id: cid, parse_mode: "HTML", reply_markup: replyKeyboard(isAdmin),
+        text: `✅ <b>Бот включён</b>\nВопросы придут в ${hh(sub.hour)}. Уровень и время — «⚙️ Настройки».`,
       });
+      if (wasOff) await notifyAdmin(env, cid, "▶️ <b>Снова включил бота</b>", sub);
     }
     return;
   }
   if (!sub) {
-    await quiet(api(env, "deleteMessage", { chat_id: cid, message_id: msg.message_id }));
-    await hint(env, cid, "Чтобы начать, нажмите /start", false);
+    await del();
+    await hint(env, cid, "Чтобы начать, нажмите /start", isAdmin);
     return;
   }
+  if (refreshProfile(sub, msg.from)) await putSub(env, cid, sub);
+
   if (cmd === "/stop") {
     sub.paused = true;
     await putSub(env, cid, sub);
     await api(env, "sendMessage", {
-      chat_id: cid, reply_markup: replyKeyboard(),
-      text: "⏸ Пауза. Вопросы больше не приходят. Включить — /start или «⚙️ Настройки».",
+      chat_id: cid, parse_mode: "HTML", reply_markup: replyKeyboard(isAdmin),
+      text: "⏸ <b>Пауза</b>\nВопросы больше не приходят. Включить — /start или «⚙️ Настройки».",
     });
+    await notifyAdmin(env, cid, "⏸ <b>Поставил бота на паузу</b>", sub);
   } else if (text === BTN_SETTINGS || cmd === "/settings") {
+    await del();
     await sendSettings(env, cid, sub);
   } else if (text === BTN_LESSON || cmd === "/lesson") {
+    await del();
     await sendLesson(env, cid, sub, false);
+  } else if (isAdmin && (text === BTN_USERS || cmd === "/users")) {
+    await del();
+    await sendUsers(env, cid);
   } else { // текст, файлы, фото, стикеры — не нужны
-    await quiet(api(env, "deleteMessage", { chat_id: cid, message_id: msg.message_id }));
-    await hint(env, cid, "Я понимаю только кнопки 👇", true);
+    await del();
+    await hint(env, cid, "Я понимаю только кнопки 👇", isAdmin);
   }
 }
 
@@ -240,6 +403,7 @@ async function handleCallback(env, cq) {
   const cid = String(cq.from.id);
   const data = cq.data || "";
   const sub = await getSub(env, cid);
+  const mid = cq.message && cq.message.message_id;
   let note = "";
   let changed = false;
   if (!sub) {
@@ -247,17 +411,21 @@ async function handleCallback(env, cq) {
   } else if (/^lv:\d+$/.test(data) && LEVELS.includes(+data.slice(3))) {
     changed = sub.level !== +data.slice(3);
     sub.level = +data.slice(3);
-    note = `Уровень: HSK ${sub.level}`;
+    note = `📚 Уровень: HSK ${sub.level}`;
   } else if (/^h:\d+$/.test(data) && SEND_HOURS.includes(+data.slice(2))) {
     changed = sub.hour !== +data.slice(2) || sub.paused;
     sub.hour = +data.slice(2);
     sub.paused = false;
-    note = `Вопросы в ${String(sub.hour).padStart(2, "0")}:00`;
+    note = `⏰ Вопросы в ${hh(sub.hour)}`;
   } else if (data === "pause") {
     sub.paused = !sub.paused;
     changed = true;
-    note = sub.paused ? "Пауза" : "Вопросы включены";
-  } else if (data === "now") {
+    note = sub.paused ? "⏸ Пауза" : "▶️ Вопросы включены";
+  } else if (data === "close") {
+    await quiet(api(env, "answerCallbackQuery", { callback_query_id: cq.id }));
+    if (mid) await quiet(api(env, "deleteMessage", { chat_id: cid, message_id: mid }));
+    return;
+  } else if (data === "now") { // кнопка из прошлых версий меню
     note = "Отправляю урок";
   }
   if (changed) {
@@ -265,16 +433,36 @@ async function handleCallback(env, cq) {
       await putSub(env, cid, sub);
     } catch (e) {
       note = "Слишком быстро, нажмите ещё раз";
+      changed = false;
     }
   }
   await quiet(api(env, "answerCallbackQuery", { callback_query_id: cq.id, text: note }));
-  const mid = cq.message && cq.message.message_id;
   if (sub && mid && changed) {
     await quiet(api(env, "editMessageText", {
-      chat_id: cid, message_id: mid, text: settingsText(sub), reply_markup: settingsKeyboard(sub),
+      chat_id: cid, message_id: mid, text: settingsText(sub), parse_mode: "HTML", reply_markup: settingsKeyboard(sub),
     }));
   }
+  if (sub && changed && data === "pause") {
+    await notifyAdmin(env, cid, sub.paused ? "⏸ <b>Поставил бота на паузу</b>" : "▶️ <b>Снял бота с паузы</b>", sub);
+  }
   if (sub && data === "now") await sendLesson(env, cid, sub, false);
+}
+
+async function handleMemberChange(env, m) {
+  if (!m.chat || m.chat.type !== "private") return;
+  const cid = String(m.chat.id);
+  const sub = await getSub(env, cid);
+  if (!sub) return;
+  const status = m.new_chat_member && m.new_chat_member.status;
+  if (status === "kicked" && !sub.blocked) {
+    sub.blocked = true;
+    await putSub(env, cid, sub);
+    await notifyAdmin(env, cid, "🚫 <b>Заблокировал бота</b>", sub);
+  } else if (status === "member" && sub.blocked) {
+    sub.blocked = false;
+    await putSub(env, cid, sub);
+    await notifyAdmin(env, cid, "✅ <b>Разблокировал бота</b>", sub);
+  }
 }
 
 async function handlePollAnswer(env, pa) {
@@ -288,7 +476,7 @@ async function handlePollAnswer(env, pa) {
 }
 
 // ---------- прогресс ----------
-async function foldAnswers(env, cid, us) {
+async function foldAnswers(env, cid, us, readOnly = false) {
   const keys = [];
   let cursor;
   do {
@@ -310,7 +498,7 @@ async function foldAnswers(env, cid, us) {
       if (!us.review.includes(m.w)) us.review.push(m.w);
     }
   }
-  return keys.map((k) => k.name);
+  return readOnly ? [] : keys.map((k) => k.name);
 }
 
 function prune(us) {
@@ -391,12 +579,15 @@ async function sendLesson(env, cid, sub, daily) {
   const now = mskNow();
   const d = isoDay(now);
   const y = us.days[isoDay(new Date(now.getTime() - DAY))];
-  let head = `🀄 Китайский на ${now.getUTCDate()} ${MONTHS[now.getUTCMonth()]} — HSK ${sub.level}, ${QUESTIONS_PER_DAY} вопросов`;
-  if (y && y[1]) head += `\nВчера: ${y[0]} из ${y[1]} верно` + (y[0] === y[1] ? " 🎉" : "");
-  if (us.review.length) head += `\nНа повторении: ${us.review.length} сл.`;
+  let head = `🀄 <b>Урок на ${now.getUTCDate()} ${MONTHS[now.getUTCMonth()]}</b>\n` +
+    `📚 HSK ${sub.level} · ${QUESTIONS_PER_DAY} вопросов`;
+  const stats = [];
+  if (y && y[1]) stats.push(`📊 Вчера: <b>${y[0]} из ${y[1]}</b> верно` + (y[0] === y[1] ? " 🎉" : ""));
+  if (us.review.length) stats.push(`🔁 На повторении: ${us.review.length} сл.`);
+  if (stats.length) head += "\n\n" + stats.join("\n");
   await api(env, "sendMessage", {
-    chat_id: cid, text: head,
-    reply_markup: { inline_keyboard: [[{ text: "📚 Открыть карточки", web_app: { url: CARDS_URL } }]] },
+    chat_id: cid, text: head, parse_mode: "HTML",
+    reply_markup: { inline_keyboard: [[{ text: "📖 Открыть карточки", web_app: { url: CARDS_URL } }]] },
   });
   const dayNo = Math.floor(Date.parse(d) / DAY);
   const words = pickWords(us, QUESTIONS_PER_DAY, sub.level);
@@ -430,14 +621,18 @@ async function sendDue(env) {
       if (sent >= MAX_LESSONS_PER_RUN) return; // остальные — в следующий запуск через 10 минут
       const cid = k.name.slice(2);
       const sub = await getSub(env, cid);
-      if (!sub || sub.paused || hour < sub.hour) continue;
+      if (!sub || sub.paused || sub.blocked || hour < sub.hour) continue;
       const us = await getJSON(env, "u:" + cid);
       if (us && us.last_sent === d) continue;
       try {
         await sendLesson(env, cid, sub, true);
       } catch (e) {
         console.log("Не удалось отправить", cid, String(e));
-        if (/blocked|chat not found|deactivated/.test(String(e))) await env.KV.delete("s:" + cid);
+        if (/blocked|chat not found|deactivated/.test(String(e))) {
+          sub.blocked = true;
+          await putSub(env, cid, sub);
+          await notifyAdmin(env, cid, "🚫 <b>Заблокировал бота</b>", sub);
+        }
       }
       sent += 1;
     }
